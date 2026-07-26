@@ -45,8 +45,9 @@ pub use soundevents::{EventSummary, SoundEvents};
 
 pub mod catalog;
 pub use catalog::{
-    build_hero_sound_index, build_voiceline_index, build_voiceline_index_with_captions,
-    caption_hash, CaptionDb, HeroSound, HeroSoundCategory, VoiceLine, ENGLISH_CAPTIONS_ENTRY,
+    build_global_sound_index, build_hero_sound_index, build_voiceline_index,
+    build_voiceline_index_with_captions, caption_hash, CaptionDb, GlobalSound, GlobalSoundCategory,
+    HeroSound, HeroSoundCategory, VoiceLine, ENGLISH_CAPTIONS_ENTRY,
 };
 
 pub mod texture_catalog;
