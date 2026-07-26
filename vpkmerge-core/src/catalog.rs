@@ -609,7 +609,14 @@ fn slot_from_vsnd(paths: &[String]) -> Option<u8> {
 }
 
 /// Prettify one event segment: split CamelCase (`LoveBites` -> `Love Bites`,
-/// `ZoomIn` -> `Zoom In`) and Title-case the words. `Wpn` reads as `Weapon`.
+/// `ZoomIn` -> `Zoom In`) and underscores (`Grasshopper_Lp` -> `Grasshopper Lp`,
+/// `Impact_wall` -> `Impact Wall`), then Title-case the words. `Wpn` reads as
+/// `Weapon`.
+///
+/// Both conventions appear, sometimes in the same segment: event authors use
+/// CamelCase for the namespaced part and `snake_case` for the clip-ish suffixes
+/// (`_lp` for a loop, `_end`, `_01`). Splitting on only one of them leaves the
+/// other verbatim in the UI.
 fn prettify_segment(seg: &str) -> String {
     if seg.eq_ignore_ascii_case("wpn") {
         return "Weapon".to_owned();
@@ -618,6 +625,15 @@ fn prettify_segment(seg: &str) -> String {
     let mut cur = String::new();
     let mut prev_lower = false;
     for ch in seg.chars() {
+        // An underscore is a word boundary, not a character: close the current
+        // word and drop the separator itself.
+        if ch == '_' {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+            prev_lower = false;
+            continue;
+        }
         if ch.is_uppercase() && prev_lower && !cur.is_empty() {
             words.push(std::mem::take(&mut cur));
         }
@@ -826,6 +842,33 @@ mod tests {
         let a = classify_hero_event("Ability.Abrams.Charge.Step");
         assert_eq!(a.category, HeroSoundCategory::Ability);
         assert_eq!(a.ability.as_deref(), Some("Charge"));
+    }
+
+    #[test]
+    fn prettify_splits_underscores_as_well_as_camelcase() {
+        // snake_case suffixes are as common as CamelCase in event names, and
+        // often share a segment with it.
+        assert_eq!(prettify_segment("Grasshopper_Lp"), "Grasshopper Lp");
+        assert_eq!(prettify_segment("Impact_wall"), "Impact Wall");
+        assert_eq!(prettify_segment("Park_walla_lp"), "Park Walla Lp");
+        assert_eq!(prettify_segment("IcePath_end"), "Ice Path End");
+        // Repeated / edge separators collapse rather than emitting empty words.
+        assert_eq!(prettify_segment("_Full__start_"), "Full Start");
+        // CamelCase-only and plain segments are unchanged.
+        assert_eq!(prettify_segment("LoveBites"), "Love Bites");
+        assert_eq!(prettify_segment("Cast"), "Cast");
+        // The `Wpn` special case still short-circuits.
+        assert_eq!(prettify_segment("Wpn"), "Weapon");
+    }
+
+    #[test]
+    fn hero_labels_carry_the_underscore_split_too() {
+        // The same helper backs hero and global labels, so a snake_case hero
+        // detail reads as prose instead of a raw token.
+        assert_eq!(
+            classify_hero_event("Bebop.Uppercut.Impact_wall").label,
+            "Impact Wall"
+        );
     }
 
     #[test]
