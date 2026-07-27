@@ -45,6 +45,119 @@ const HERO_VO_STEM: &str = "generated_vo_hero_";
 /// counterpart to the VO tree).
 const HERO_TREE_PREFIX: &str = "soundevents/hero/";
 
+/// Root of every soundevents tree in the pak.
+const SOUNDEVENTS_PREFIX_ALL: &str = "soundevents/";
+
+/// How far to walk a `base` chain before giving up. Real chains are 1-2 links
+/// (`Abrams.Wpn.Impact` -> `Base.Bullet.Impact.Shotgun` -> `Base.Bullet.Impact`);
+/// the cap plus the visited set is belt-and-braces against a malformed pak
+/// pointing a template at itself.
+const MAX_BASE_DEPTH: usize = 8;
+
+/// Every event in the pak that can serve as an inheritance target: event name ->
+/// (its own clips, its `base` ref). Built once and shared by the hero and global
+/// indexes.
+///
+/// This has to span the WHOLE `soundevents/` tree, not one file: templates are
+/// referenced across files with no locality at all. `Abrams.Wpn.Whizby` lives in
+/// `soundevents/hero/abrams.vsndevts_c` and inherits `Base.Bullet.Whizby.Shotgun`
+/// from `soundevents/base/weapons_shared.vsndevts_c`, which in turn inherits
+/// `Base.Bullet.Impact` from `soundevents/base/citadel_base_events.vsndevts_c`.
+type BaseTable = HashMap<String, (Vec<String>, Option<String>)>;
+
+fn build_base_table(vpk: &valve_pak::VPK) -> BaseTable {
+    let mut entries: Vec<String> = vpk
+        .file_paths()
+        .filter(|p| p.starts_with(SOUNDEVENTS_PREFIX_ALL) && p.ends_with(".vsndevts_c"))
+        .cloned()
+        .collect();
+    entries.sort();
+
+    let mut table: BaseTable = HashMap::new();
+    for entry in &entries {
+        let Ok(mut file) = vpk.get_file(entry) else {
+            continue;
+        };
+        let Ok(bytes) = file.read_all() else {
+            continue;
+        };
+        // A file that fails to decode must not sink the table; the events it
+        // would have contributed simply stay unresolvable.
+        let Ok(se) = SoundEvents::from_bytes(bytes) else {
+            continue;
+        };
+        let Value::Object(pairs) = &se.root else {
+            continue;
+        };
+        for (name, event) in pairs {
+            if name == "base" {
+                continue;
+            }
+            table.insert(
+                name.clone(),
+                (
+                    event_own_clips(event),
+                    event.get("base").and_then(Value::as_str).map(str::to_owned),
+                ),
+            );
+        }
+    }
+    table
+}
+
+/// An event's own `vsnd_files`, normalizing the single-string spelling to a
+/// one-element list. Empty when the event declares none.
+fn event_own_clips(event: &Value) -> Vec<String> {
+    match event.get("vsnd_files") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        Some(Value::String(s)) => vec![s.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// Resolve the clips an event actually plays, following `base` when it declares
+/// none of its own. Returns the clips plus the template they came from, or
+/// `None` for that second field when the event owns its clips outright.
+///
+/// **The inherited case is a shared pool, and callers must treat it as one.**
+/// `Abrams.Wpn.Whizby` has no clips; it plays
+/// `Base.Bullet.Whizby.Shotgun`'s 20. Those same clips back every other
+/// shotgun hero's whizby, so overriding them changes the sound for all of
+/// them, not just Abrams. That is why the source template is returned rather
+/// than silently folded in: a UI needs to be able to say so before a user
+/// swaps.
+fn resolve_clips(
+    own: Vec<String>,
+    base: Option<&str>,
+    table: &BaseTable,
+) -> (Vec<String>, Option<String>) {
+    if !own.is_empty() {
+        return (own, None);
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    let mut cursor = base;
+    for _ in 0..MAX_BASE_DEPTH {
+        let Some(name) = cursor else { break };
+        // Cycle guard: a template chain that revisits a name would loop forever.
+        if seen.contains(&name) {
+            break;
+        }
+        seen.push(name);
+        let Some((clips, next)) = table.get(name) else {
+            break; // dangling template reference
+        };
+        if !clips.is_empty() {
+            return (clips.clone(), Some(name.to_owned()));
+        }
+        cursor = next.as_deref();
+    }
+    (Vec::new(), None)
+}
+
 /// One VO sound event, ready to search and swap.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VoiceLine {
@@ -394,6 +507,15 @@ pub struct HeroSound {
     pub vsnd: Vec<String>,
     /// Engine playback duration in seconds, if the event records one.
     pub duration: Option<f64>,
+    /// The template these clips were inherited from, when the event declares no
+    /// `vsnd_files` of its own (`Abrams.Wpn.Whizby` ->
+    /// `Base.Bullet.Whizby.Shotgun`). `None` means the event owns its clips.
+    ///
+    /// **Treat a `Some` here as a shared pool.** The same clips back every other
+    /// event inheriting that template, so overriding them changes all of those
+    /// sounds, not just this one. A UI should say so before offering the swap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_from: Option<String>,
 }
 
 /// Build the hero gameplay-sound index from the `soundevents/hero/` tree in
@@ -408,6 +530,10 @@ pub fn build_hero_sound_index(vpk_path: impl AsRef<Path>) -> Result<Vec<HeroSoun
     let vpk_path = vpk_path.as_ref();
     let vpk =
         valve_pak::open(vpk_path).with_context(|| format!("opening {}", vpk_path.display()))?;
+
+    // Templates are referenced across files, so the inheritance table spans the
+    // whole soundevents tree, not just the hero one. Built once per index.
+    let base_table = build_base_table(&vpk);
 
     let mut entries: Vec<String> = vpk
         .file_paths()
@@ -439,16 +565,15 @@ pub fn build_hero_sound_index(vpk_path: impl AsRef<Path>) -> Result<Vec<HeroSoun
             if name == "base" {
                 continue;
             }
-            let vsnd = match event.get("vsnd_files") {
-                Some(Value::Array(items)) => items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect(),
-                Some(Value::String(s)) => vec![s.clone()],
-                _ => Vec::new(),
-            };
-            // Events with no clips (pure parameter/template rows) aren't playable.
+            // An event with no `vsnd_files` of its own usually still plays
+            // something: it inherits a template's pool. Resolving that is the
+            // difference between indexing `Abrams.Wpn.Whizby` and dropping it.
+            let (vsnd, inherited_from) = resolve_clips(
+                event_own_clips(event),
+                event.get("base").and_then(Value::as_str),
+                &base_table,
+            );
+            // Still nothing after resolution: a pure parameter row, not playable.
             if vsnd.is_empty() {
                 continue;
             }
@@ -468,6 +593,7 @@ pub fn build_hero_sound_index(vpk_path: impl AsRef<Path>) -> Result<Vec<HeroSoun
                 duration: event.get("vsnd_duration").and_then(Value::as_f64),
                 hero: hero.clone(),
                 vsnd,
+                inherited_from,
                 event: name.clone(),
             });
         }
@@ -1052,6 +1178,105 @@ mod tests {
             classify_hero_event("Atlas.Progession.Page.Win.VO").category,
             HeroSoundCategory::Other
         );
+    }
+
+    fn table(rows: &[(&str, &[&str], Option<&str>)]) -> BaseTable {
+        rows.iter()
+            .map(|(name, clips, base)| {
+                (
+                    (*name).to_owned(),
+                    (
+                        clips.iter().map(|c| (*c).to_owned()).collect(),
+                        base.map(str::to_owned),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn own_clips_win_and_are_not_marked_inherited() {
+        let t = table(&[("Base.Movement", &["b.vsnd"], None)]);
+        let (clips, from) = resolve_clips(vec!["own.vsnd".to_owned()], Some("Base.Movement"), &t);
+        assert_eq!(clips, vec!["own.vsnd".to_owned()]);
+        assert_eq!(from, None);
+    }
+
+    #[test]
+    fn clipless_event_inherits_its_template() {
+        // The Abrams.Wpn.Whizby shape: no own clips, one hop to a template.
+        let t = table(&[("Base.Bullet.Whizby.Shotgun", &["w1.vsnd", "w2.vsnd"], None)]);
+        let (clips, from) = resolve_clips(Vec::new(), Some("Base.Bullet.Whizby.Shotgun"), &t);
+        assert_eq!(clips.len(), 2);
+        assert_eq!(from.as_deref(), Some("Base.Bullet.Whizby.Shotgun"));
+    }
+
+    #[test]
+    fn walks_a_multi_link_chain_to_the_first_template_with_clips() {
+        // The real Abrams.Wpn.Impact shape, which no single hop resolves:
+        // Base.Bullet.Impact.Shotgun carries only parameters and defers again.
+        let t = table(&[
+            (
+                "Base.Bullet.Impact.Shotgun",
+                &[],
+                Some("Base.Bullet.Impact"),
+            ),
+            ("Base.Bullet.Impact", &["i1.vsnd"], None),
+        ]);
+        let (clips, from) = resolve_clips(Vec::new(), Some("Base.Bullet.Impact.Shotgun"), &t);
+        assert_eq!(clips, vec!["i1.vsnd".to_owned()]);
+        // Credit the template that actually supplied the clips, not the first hop.
+        assert_eq!(from.as_deref(), Some("Base.Bullet.Impact"));
+    }
+
+    #[test]
+    fn a_cyclic_chain_terminates_instead_of_hanging() {
+        let t = table(&[("A", &[], Some("B")), ("B", &[], Some("A"))]);
+        let (clips, from) = resolve_clips(Vec::new(), Some("A"), &t);
+        assert!(clips.is_empty());
+        assert_eq!(from, None);
+    }
+
+    #[test]
+    fn a_dangling_template_reference_resolves_to_nothing() {
+        let t = table(&[("Real", &["r.vsnd"], None)]);
+        let (clips, from) = resolve_clips(Vec::new(), Some("Missing"), &t);
+        assert!(clips.is_empty());
+        assert_eq!(from, None);
+    }
+
+    #[test]
+    fn an_event_with_neither_clips_nor_base_stays_unplayable() {
+        let (clips, from) = resolve_clips(Vec::new(), None, &table(&[]));
+        assert!(clips.is_empty());
+        assert_eq!(from, None);
+    }
+
+    #[test]
+    fn a_chain_longer_than_the_cap_gives_up_rather_than_spinning() {
+        // Each link defers to the next; the payload sits past MAX_BASE_DEPTH.
+        let names: Vec<String> = (0..MAX_BASE_DEPTH + 3).map(|i| format!("L{i}")).collect();
+        let mut t: BaseTable = HashMap::new();
+        for (i, name) in names.iter().enumerate() {
+            let next = names.get(i + 1).cloned();
+            t.insert(name.clone(), (Vec::new(), next));
+        }
+        let last = names.last().unwrap().clone();
+        t.insert(last, (vec!["deep.vsnd".to_owned()], None));
+        let (clips, _) = resolve_clips(Vec::new(), Some("L0"), &t);
+        assert!(
+            clips.is_empty(),
+            "should bail at the depth cap, not walk on"
+        );
+    }
+
+    #[test]
+    fn single_string_vsnd_files_normalizes_to_a_one_element_pool() {
+        let event = Value::Object(vec![(
+            "vsnd_files".to_owned(),
+            Value::String("solo.vsnd".to_owned()),
+        )]);
+        assert_eq!(event_own_clips(&event), vec!["solo.vsnd".to_owned()]);
     }
 
     #[test]

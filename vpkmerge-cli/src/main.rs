@@ -4439,6 +4439,10 @@ fn run_catalog_herosounds(args: &HeroSoundsArgs) -> Result<()> {
                     "label": s.label,
                     "vsnd": s.vsnd,
                     "duration": s.duration,
+                    // Present only when the event owns no clips and plays a
+                    // template's pool. That pool is SHARED with every other
+                    // event inheriting it, so a swap is not hero-local.
+                    "inheritedFrom": s.inherited_from,
                 })
             })
             .collect();
@@ -4456,13 +4460,19 @@ fn run_catalog_herosounds(args: &HeroSoundsArgs) -> Result<()> {
             "hero", "category", "clips", "event"
         );
         for s in &sounds[..shown] {
+            // Flag inherited rows inline: their clips are a shared template
+            // pool, so swapping them is not scoped to this hero.
+            let shared = match &s.inherited_from {
+                Some(from) => format!("{}  [shared: {from}]", s.label),
+                None => s.label.clone(),
+            };
             println!(
                 "  {:<12} {:<9} {:>5}  {:<46} {}",
                 s.hero,
                 category_label(s.category),
                 s.vsnd.len(),
                 s.event,
-                s.label,
+                shared,
             );
         }
     }
