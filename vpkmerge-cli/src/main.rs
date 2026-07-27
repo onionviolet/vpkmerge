@@ -13,10 +13,15 @@ use vpkmerge_core::{
     SoulImportCloneOptions, SoulOrient, SoundEvents, SplitOptions, SplitOutput,
 };
 
+/// Package version plus a build id when one could be derived (see build.rs).
+/// Consumers parse the leading semver, so the ` (<sha>)` suffix is additive:
+/// Grimoire's engine switcher shows the whole string, which is the point.
+const VERSION: &str = env!("VPKMERGE_VERSION");
+
 #[derive(Parser)]
 #[command(
     name = "vpkmerge",
-    version,
+    version = VERSION,
     about = "Combine multiple VPK files into one (or split one into many).",
     long_about = "Combine multiple Valve Pak (VPK) files into one. Built for Deadlock \
                   modding so players can consolidate several mods into a single addon VPK.\n\
