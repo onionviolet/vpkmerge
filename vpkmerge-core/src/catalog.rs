@@ -32,6 +32,9 @@ use crate::soundevents::SoundEvents;
 pub const ENGLISH_CAPTIONS_ENTRY: &str =
     "resource/localization/citadel_generated_vo/citadel_generated_vo_english.dat";
 
+/// Root of every soundevents tree in the pak.
+const SOUNDEVENTS_PREFIX: &str = "soundevents/";
+
 /// The per-hero / announcer VO tree.
 const VO_TREE_PREFIX: &str = "soundevents/vo/";
 /// Per-hero VO files are named `generated_vo_hero_<code>.vsndevts_c`.
@@ -458,6 +461,183 @@ fn hero_from_hero_entry(entry: &str) -> Option<String> {
     Some(stem.to_owned())
 }
 
+/// Which broad family a non-hero (global) soundevent belongs to. Unlike hero
+/// events, global event *names* follow no single convention across files
+/// (`UI.Click`, `Powerup.Pickup`, `Trooper.Death`), so the category comes from
+/// the event's **source file**, which is how the game itself groups them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GlobalSoundCategory {
+    /// Menu / HUD / shop clicks, the chat wheel: `soundevents/ui`, `base/ui`.
+    Ui,
+    /// Score and menu music: `soundevents/music*`, `base/music`.
+    Music,
+    /// World ambience beds: the `soundevents/ambience/` tree, ambient emitters.
+    Ambience,
+    /// Non-player combatants: the `soundevents/npc/` tree (troopers, guardians,
+    /// walkers, patron, neutral camps).
+    Npc,
+    /// Shop-item sounds: the `soundevents/mods/` tree (weapon / armor / tech).
+    Item,
+    /// Match gameplay: damage, status effects, powerups, ziplines, the local
+    /// player, breakables, world objects, shared weapon layers.
+    Gameplay,
+    /// Non-hero-tree voice: announcer-adjacent and generated pick / death VO
+    /// that lives outside `soundevents/vo/`.
+    Voice,
+    /// Anything else, including dev/tools files that still carry playable clips.
+    Other,
+}
+
+/// One playable non-hero soundevent: UI, music, ambience, NPC, item, gameplay.
+/// The counterpart to [`HeroSound`] for everything outside `soundevents/hero/`
+/// and `soundevents/vo/`, which have their own indexes.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GlobalSound {
+    /// Soundevent name, e.g. `UI.Click`. Usable verbatim as `soundswap --event`.
+    pub event: String,
+    /// Entry path of the soundevents file the event was read from, e.g.
+    /// `soundevents/ui.vsndevts_c`. This is what `soundswap --soundevents`
+    /// wants: the global path has no hero to infer the file from.
+    pub soundevents: String,
+    /// Short source name derived from `soundevents`, e.g. `ui`, `npc/troopers`.
+    /// The grouping key for a browse UI.
+    pub source: String,
+    /// Which family the event belongs to (from `source`, see the enum note).
+    pub category: GlobalSoundCategory,
+    /// Human-readable label derived from the event name, e.g. `"Ui Click"`.
+    /// The searchable text.
+    pub label: String,
+    /// Clip path(s) the event plays (more than one == a randomizer pool).
+    pub vsnd: Vec<String>,
+    /// Engine playback duration in seconds, if the event records one.
+    pub duration: Option<f64>,
+}
+
+/// Build the global (non-hero) sound index from `vpk_path`: one [`GlobalSound`]
+/// per playable event across every `soundevents/**.vsndevts_c` that is *not* in
+/// the hero (`soundevents/hero/`) or VO (`soundevents/vo/`) trees, which
+/// [`build_hero_sound_index`] and [`build_voiceline_index`] already cover.
+/// Together the three indexes span Deadlock's whole swappable audio surface.
+///
+/// Rows are sorted by source then event for a stable index. Events with no clips
+/// (pure parameter/template rows, and the `base` inheritance key) are dropped, as
+/// are files that fail to decode: one bad file must not sink the index.
+pub fn build_global_sound_index(vpk_path: impl AsRef<Path>) -> Result<Vec<GlobalSound>> {
+    let vpk_path = vpk_path.as_ref();
+    let vpk =
+        valve_pak::open(vpk_path).with_context(|| format!("opening {}", vpk_path.display()))?;
+
+    let mut entries: Vec<String> = vpk
+        .file_paths()
+        .filter(|p| {
+            p.starts_with(SOUNDEVENTS_PREFIX)
+                && p.ends_with(".vsndevts_c")
+                && !p.starts_with(HERO_TREE_PREFIX)
+                && !p.starts_with(VO_TREE_PREFIX)
+        })
+        .cloned()
+        .collect();
+    entries.sort();
+
+    let mut sounds = Vec::new();
+    for entry in &entries {
+        let source = global_source_name(entry);
+        let category = classify_global_source(&source);
+        let mut file = vpk
+            .get_file(entry)
+            .with_context(|| format!("locating {entry}"))?;
+        let bytes = file
+            .read_all()
+            .with_context(|| format!("reading {entry}"))?;
+        let Ok(se) = SoundEvents::from_bytes(bytes) else {
+            continue;
+        };
+        let Value::Object(pairs) = &se.root else {
+            continue;
+        };
+        for (name, event) in pairs {
+            if name == "base" {
+                continue;
+            }
+            let vsnd = match event.get("vsnd_files") {
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+                Some(Value::String(s)) => vec![s.clone()],
+                _ => Vec::new(),
+            };
+            if vsnd.is_empty() {
+                continue;
+            }
+            let segs: Vec<&str> = name.split('.').filter(|s| !s.is_empty()).collect();
+            sounds.push(GlobalSound {
+                label: prettify_segments(&segs),
+                duration: event.get("vsnd_duration").and_then(Value::as_f64),
+                soundevents: entry.clone(),
+                source: source.clone(),
+                category,
+                vsnd,
+                event: name.clone(),
+            });
+        }
+    }
+
+    sounds.sort_by(|a, b| a.source.cmp(&b.source).then_with(|| a.event.cmp(&b.event)));
+    Ok(sounds)
+}
+
+/// Source name from a global soundevents entry path: the path relative to
+/// `soundevents/`, minus the extension. `soundevents/npc/troopers.vsndevts_c`
+/// -> `npc/troopers`; `soundevents/ui.vsndevts_c` -> `ui`.
+fn global_source_name(entry: &str) -> String {
+    entry
+        .strip_prefix(SOUNDEVENTS_PREFIX)
+        .unwrap_or(entry)
+        .strip_suffix(".vsndevts_c")
+        .unwrap_or(entry)
+        .to_owned()
+}
+
+/// Category for a global source name. Matched on the source (the game's own
+/// grouping) rather than the event name, which has no cross-file convention.
+fn classify_global_source(source: &str) -> GlobalSoundCategory {
+    // Tree prefixes first: everything under these directories shares a family.
+    if let Some((dir, _)) = source.split_once('/') {
+        match dir {
+            "ambience" => return GlobalSoundCategory::Ambience,
+            "npc" => return GlobalSoundCategory::Npc,
+            "mods" => return GlobalSoundCategory::Item,
+            _ => {}
+        }
+    }
+    // `base/*` holds shared layers whose family is the leaf name.
+    let leaf = source.rsplit('/').next().unwrap_or(source);
+    match leaf {
+        "ui" | "chat_wheel" => GlobalSoundCategory::Ui,
+        "music" | "music_arpeggiator" => GlobalSoundCategory::Music,
+        "ambience" | "world_ambient_emitters" => GlobalSoundCategory::Ambience,
+        "damage"
+        | "status_effects"
+        | "powerups"
+        | "gameplay"
+        | "player"
+        | "ziplines"
+        | "breakables"
+        | "utility"
+        | "world"
+        | "cosmetics"
+        | "citadel_base_events"
+        | "weapons_shared" => GlobalSoundCategory::Gameplay,
+        // The generated pick/death VO and the new-player lines sit outside the
+        // `vo/` tree but are still voice.
+        s if s.contains("_vo") || s.starts_with("generated_vo") => GlobalSoundCategory::Voice,
+        _ => GlobalSoundCategory::Other,
+    }
+}
+
 /// Generic grouping segments that pin a non-ability category. Anything not in
 /// these (after the speaker prefix and an optional `A1..A4` slot token) is read
 /// as a named ability.
@@ -753,6 +933,39 @@ mod tests {
             hero_from_vo_entry("soundevents/vo/announcer.vsndevts_c"),
             None
         );
+    }
+
+    #[test]
+    fn global_source_name_strips_prefix_and_extension() {
+        assert_eq!(global_source_name("soundevents/ui.vsndevts_c"), "ui");
+        assert_eq!(
+            global_source_name("soundevents/npc/troopers.vsndevts_c"),
+            "npc/troopers"
+        );
+    }
+
+    #[test]
+    fn global_sources_classify_by_tree_then_leaf() {
+        use GlobalSoundCategory as C;
+        // Tree prefixes win, whatever the leaf is called.
+        assert_eq!(classify_global_source("ambience/lanes"), C::Ambience);
+        assert_eq!(classify_global_source("npc/troopers"), C::Npc);
+        assert_eq!(classify_global_source("mods/weapon"), C::Item);
+        // `base/*` and the loose files classify on the leaf name.
+        assert_eq!(classify_global_source("base/ui"), C::Ui);
+        assert_eq!(classify_global_source("ui"), C::Ui);
+        assert_eq!(classify_global_source("music_arpeggiator"), C::Music);
+        assert_eq!(classify_global_source("base/ambience"), C::Ambience);
+        assert_eq!(classify_global_source("base/weapons_shared"), C::Gameplay);
+        assert_eq!(classify_global_source("damage"), C::Gameplay);
+        // VO that lives outside the `vo/` tree is still voice.
+        assert_eq!(classify_global_source("new_player_vo"), C::Voice);
+        assert_eq!(
+            classify_global_source("generated_vo_hero_pick_vo"),
+            C::Voice
+        );
+        // Dev/tools files fall through.
+        assert_eq!(classify_global_source("soundevents_from_tools"), C::Other);
     }
 
     #[test]
