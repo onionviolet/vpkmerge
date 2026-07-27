@@ -4539,6 +4539,7 @@ fn run_catalog_globalsounds(args: &GlobalSoundsArgs) -> Result<()> {
                     "label": s.label,
                     "vsnd": s.vsnd,
                     "duration": s.duration,
+                    "inheritedFrom": s.inherited_from,
                 })
             })
             .collect();

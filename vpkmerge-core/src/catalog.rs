@@ -665,6 +665,10 @@ pub struct GlobalSound {
     pub vsnd: Vec<String>,
     /// Engine playback duration in seconds, if the event records one.
     pub duration: Option<f64>,
+    /// Template these clips came from when the event declares none of its own.
+    /// A `Some` here means a SHARED pool: see [`resolve_clips`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_from: Option<String>,
 }
 
 /// Build the global (non-hero) sound index from `vpk_path`: one [`GlobalSound`]
@@ -680,6 +684,10 @@ pub fn build_global_sound_index(vpk_path: impl AsRef<Path>) -> Result<Vec<Global
     let vpk_path = vpk_path.as_ref();
     let vpk =
         valve_pak::open(vpk_path).with_context(|| format!("opening {}", vpk_path.display()))?;
+
+    // Same pak-wide inheritance table the hero index uses: global events defer
+    // to templates across files exactly like hero ones do.
+    let base_table = build_base_table(&vpk);
 
     let mut entries: Vec<String> = vpk
         .file_paths()
@@ -713,20 +721,17 @@ pub fn build_global_sound_index(vpk_path: impl AsRef<Path>) -> Result<Vec<Global
             if name == "base" {
                 continue;
             }
-            let vsnd = match event.get("vsnd_files") {
-                Some(Value::Array(items)) => items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect(),
-                Some(Value::String(s)) => vec![s.clone()],
-                _ => Vec::new(),
-            };
+            let (vsnd, inherited_from) = resolve_clips(
+                event_own_clips(event),
+                event.get("base").and_then(Value::as_str),
+                &base_table,
+            );
             if vsnd.is_empty() {
                 continue;
             }
             let segs: Vec<&str> = name.split('.').filter(|s| !s.is_empty()).collect();
             sounds.push(GlobalSound {
+                inherited_from,
                 label: prettify_segments(&segs),
                 duration: event.get("vsnd_duration").and_then(Value::as_f64),
                 soundevents: entry.clone(),
