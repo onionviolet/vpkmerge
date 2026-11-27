@@ -27,9 +27,9 @@ packs every clip plus the edited `.vsndevts_c` into one addon VPK.
 ```bash
 PAK="$HOME/.local/share/Steam/steamapps/common/Deadlock/game/citadel/pak01_dir.vpk"
 
-# preview the plan (touches no audio)
+# preview the plan without a game archive or output path
 cargo run --release --example build_music_pack -- \
-  music-packs/title-fight/manifest.json "$PAK" /tmp/title_fight_dir.vpk --dry-run
+  music-packs/title-fight/manifest.json --dry-run
 
 # build the addon VPK
 cargo run --release --example build_music_pack -- \

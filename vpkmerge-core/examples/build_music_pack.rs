@@ -14,7 +14,8 @@
 //!
 //! Usage:
 //!   cargo run --release --example build_music_pack -- \
-//!     <manifest.json> <base_pak01_dir.vpk> <out_dir.vpk> [--donor ENTRY] [--dry-run]
+//!     <manifest.json> <base_pak01_dir.vpk> <out_dir.vpk> [--donor ENTRY]
+//!   cargo run --release --example build_music_pack -- <manifest.json> --dry-run [--donor ENTRY]
 //!
 //! Manifest entries may live under `entries`, `music_entries`, and/or
 //! `sfx_entries`. Each entry needs `local_audio`, `target_vsnd`,
@@ -65,28 +66,30 @@ struct Entry {
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let manifest_path = PathBuf::from(args.next().context(
-        "usage: build_music_pack <manifest.json> <base.vpk> <out_dir.vpk> [--donor ENTRY] [--dry-run]",
+        "usage: build_music_pack <manifest.json> (<base.vpk> <out_dir.vpk> | --dry-run) [--donor ENTRY]",
     )?);
-    let base = args.next().context("missing base pak01_dir.vpk")?;
-    let out = args.next().context("missing out_dir.vpk")?;
 
     let mut donor_entry = DEFAULT_DONOR.to_owned();
     let mut dry_run = false;
-    let rest: Vec<String> = args.collect();
-    let mut i = 0;
-    while i < rest.len() {
-        match rest[i].as_str() {
-            "--donor" => {
-                donor_entry = rest.get(i + 1).context("--donor needs a value")?.clone();
-                i += 2;
-            }
-            "--dry-run" => {
-                dry_run = true;
-                i += 1;
-            }
+    let (mut base, mut out) = (None, None);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--donor" => donor_entry = args.next().context("--donor needs a value")?,
+            "--dry-run" => dry_run = true,
+            flag if flag.starts_with('-') => bail!("unknown arg: {flag}"),
+            _ if base.is_none() => base = Some(arg),
+            _ if out.is_none() => out = Some(arg),
             other => bail!("unknown arg: {other}"),
         }
     }
+    let build_paths = if dry_run {
+        None
+    } else {
+        Some((
+            base.context("missing base pak01_dir.vpk")?,
+            out.context("missing out_dir.vpk")?,
+        ))
+    };
 
     let manifest_dir = manifest_path
         .parent()
@@ -116,7 +119,7 @@ fn main() -> Result<()> {
         "manifest has no entries / music_entries / sfx_entries"
     );
 
-    if dry_run {
+    let Some((base, out)) = build_paths else {
         println!(
             "plan: {} manifest clip(s); donor = {donor_entry}",
             entries.len()
@@ -139,7 +142,7 @@ fn main() -> Result<()> {
             );
         }
         return Ok(());
-    }
+    };
 
     let (present, missing): (Vec<Entry>, Vec<Entry>) =
         entries.into_iter().partition(|e| e.local_audio.exists());

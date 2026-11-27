@@ -71,7 +71,7 @@ PAK="$HOME/.local/share/Steam/steamapps/common/Deadlock/game/citadel/pak01_dir.v
 
 # preview (lists every entry; flags ones still missing source audio)
 cargo run --release --example build_music_pack -- \
-  music-packs/pokemon/manifest.json "$PAK" /tmp/pokemon_dir.vpk --dry-run
+  music-packs/pokemon/manifest.json --dry-run
 
 # build once source_audio/ is populated
 cargo run --release --example build_music_pack -- \
